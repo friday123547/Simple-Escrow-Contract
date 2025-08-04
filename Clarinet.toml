@@ -9,21 +9,6 @@ requirements = []
 path = 'contracts/simple-escrow-contract.clar'
 clarity_version = 3
 epoch = 3.1
-
-[contracts.dispute-arbitrator]
-path = 'contracts/dispute-arbitrator.clar'
-clarity_version = 3
-epoch = 3.1
-
-[contracts.timelock-escrow]
-path = 'contracts/timelock-escrow.clar'
-clarity_version = 3
-epoch = 3.1
-
-[contracts.escrow-factory]
-path = 'contracts/escrow-factory.clar'
-clarity_version = 3
-epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
