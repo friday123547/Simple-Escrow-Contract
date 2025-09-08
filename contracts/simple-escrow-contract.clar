@@ -11,9 +11,15 @@
 (define-constant ERR_APPROVER_NOT_FOUND (err u109))
 (define-constant ERR_THRESHOLD_NOT_MET (err u110))
 (define-constant ERR_DUPLICATE_APPROVER (err u111))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u112))
+(define-constant ERR_MILESTONE_COMPLETED (err u113))
+(define-constant ERR_INVALID_MILESTONE_COUNT (err u114))
+(define-constant ERR_ALL_MILESTONES_COMPLETED (err u115))
+(define-constant ERR_MILESTONE_NOT_COMPLETED (err u116))
 
 (define-data-var escrow-counter uint u0)
 (define-data-var multisig-counter uint u0)
+(define-data-var milestone-counter uint u0)
 
 (define-map escrows
   uint
@@ -51,6 +57,29 @@
 )
 
 (define-map multisig-user-escrows
+  principal
+  (list 50 uint)
+)
+
+(define-map milestone-escrows
+  uint
+  {
+    payer: principal,
+    recipient: principal,
+    total-amount: uint,
+    milestone-count: uint,
+    completed-milestones: uint,
+    milestone-amounts: (list 10 uint),
+    milestone-descriptions: (list 10 (string-ascii 100)),
+    milestone-completed: (list 10 bool),
+    milestone-approved: (list 10 bool),
+    released: bool,
+    refunded: bool,
+    created-at: uint
+  }
+)
+
+(define-map milestone-user-escrows
   principal
   (list 50 uint)
 )
@@ -114,6 +143,123 @@
     (fold update-approver-entry approvers multisig-id)
     (var-set multisig-counter multisig-id)
     (ok multisig-id)
+  )
+)
+
+(define-public (create-milestone-escrow 
+  (recipient principal) 
+  (amounts (list 10 uint)) 
+  (descriptions (list 10 (string-ascii 100))))
+  (let
+    (
+      (milestone-id (+ (var-get milestone-counter) u1))
+      (total-amount (fold + amounts u0))
+      (milestone-count (len amounts))
+    )
+    (asserts! (> total-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (not (is-eq tx-sender recipient)) ERR_NOT_AUTHORIZED)
+    (asserts! (and (> milestone-count u0) (<= milestone-count u10)) ERR_INVALID_MILESTONE_COUNT)
+    (asserts! (is-eq milestone-count (len descriptions)) ERR_INVALID_MILESTONE_COUNT)
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    (map-set milestone-escrows milestone-id
+      {
+        payer: tx-sender,
+        recipient: recipient,
+        total-amount: total-amount,
+        milestone-count: milestone-count,
+        completed-milestones: u0,
+        milestone-amounts: amounts,
+        milestone-descriptions: descriptions,
+        milestone-completed: (create-false-list milestone-count),
+        milestone-approved: (create-false-list milestone-count),
+        released: false,
+        refunded: false,
+        created-at: stacks-block-height
+      }
+    )
+    (update-milestone-user-escrows tx-sender milestone-id)
+    (update-milestone-user-escrows recipient milestone-id)
+    (var-set milestone-counter milestone-id)
+    (ok milestone-id)
+  )
+)
+
+(define-public (complete-milestone (milestone-id uint) (milestone-index uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? milestone-escrows milestone-id) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get recipient escrow)) ERR_NOT_AUTHORIZED)
+    (asserts! (< milestone-index (get milestone-count escrow)) ERR_MILESTONE_NOT_FOUND)
+    (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_RELEASED)
+    (asserts! (not (get refunded escrow)) ERR_ESCROW_ALREADY_REFUNDED)
+    (asserts! (not (unwrap-panic (element-at (get milestone-completed escrow) milestone-index))) ERR_MILESTONE_COMPLETED)
+    (let
+      (
+        (new-completed-count (+ (get completed-milestones escrow) u1))
+      )
+      (map-set milestone-escrows milestone-id
+        (merge escrow 
+          {
+            completed-milestones: new-completed-count
+          }
+        )
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (approve-milestone (milestone-id uint) (milestone-index uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? milestone-escrows milestone-id) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get payer escrow)) ERR_NOT_AUTHORIZED)
+    (asserts! (< milestone-index (get milestone-count escrow)) ERR_MILESTONE_NOT_FOUND)
+    (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_RELEASED)
+    (asserts! (not (get refunded escrow)) ERR_ESCROW_ALREADY_REFUNDED)
+    (asserts! (unwrap-panic (element-at (get milestone-completed escrow) milestone-index)) ERR_MILESTONE_NOT_COMPLETED)
+    (asserts! (not (unwrap-panic (element-at (get milestone-approved escrow) milestone-index))) ERR_ALREADY_APPROVED)
+    (let
+      (
+        (milestone-amount (unwrap-panic (element-at (get milestone-amounts escrow) milestone-index)))
+      )
+      (try! (as-contract (stx-transfer? milestone-amount tx-sender (get recipient escrow))))
+      (ok milestone-amount)
+    )
+  )
+)
+
+(define-public (release-all-milestones (milestone-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? milestone-escrows milestone-id) ERR_ESCROW_NOT_FOUND))
+      (remaining-amount (calculate-remaining-amount escrow))
+    )
+    (asserts! (is-eq tx-sender (get payer escrow)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_RELEASED)
+    (asserts! (not (get refunded escrow)) ERR_ESCROW_ALREADY_REFUNDED)
+    (asserts! (> remaining-amount u0) ERR_INVALID_AMOUNT)
+    (try! (as-contract (stx-transfer? remaining-amount tx-sender (get recipient escrow))))
+    (map-set milestone-escrows milestone-id (merge escrow { released: true }))
+    (ok remaining-amount)
+  )
+)
+
+(define-public (refund-milestone-escrow (milestone-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? milestone-escrows milestone-id) ERR_ESCROW_NOT_FOUND))
+      (remaining-amount (calculate-remaining-amount escrow))
+    )
+    (asserts! (is-eq tx-sender (get payer escrow)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_RELEASED)
+    (asserts! (not (get refunded escrow)) ERR_ESCROW_ALREADY_REFUNDED)
+    (asserts! (> remaining-amount u0) ERR_INVALID_AMOUNT)
+    (try! (as-contract (stx-transfer? remaining-amount tx-sender (get payer escrow))))
+    (map-set milestone-escrows milestone-id (merge escrow { refunded: true }))
+    (ok remaining-amount)
   )
 )
 
@@ -263,6 +409,10 @@
   (map-get? multisig-escrows multisig-id)
 )
 
+(define-read-only (get-milestone-escrow (milestone-id uint))
+  (map-get? milestone-escrows milestone-id)
+)
+
 (define-read-only (get-multisig-status (multisig-id uint))
   (let
     (
@@ -294,6 +444,24 @@
   )
 )
 
+(define-read-only (get-milestone-status (milestone-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? milestone-escrows milestone-id) ERR_ESCROW_NOT_FOUND))
+    )
+    (ok {
+      milestone-count: (get milestone-count escrow),
+      completed-milestones: (get completed-milestones escrow),
+
+      total-amount: (get total-amount escrow),
+      remaining-amount: (calculate-remaining-amount escrow),
+      released: (get released escrow),
+      refunded: (get refunded escrow),
+      progress-percentage: (/ (* (get completed-milestones escrow) u100) (get milestone-count escrow))
+    })
+  )
+)
+
 (define-read-only (get-user-escrows (user principal))
   (default-to (list) (map-get? user-escrows user))
 )
@@ -302,12 +470,20 @@
   (default-to (list) (map-get? multisig-user-escrows user))
 )
 
+(define-read-only (get-user-milestone-escrows (user principal))
+  (default-to (list) (map-get? milestone-user-escrows user))
+)
+
 (define-read-only (get-escrow-count)
   (var-get escrow-counter)
 )
 
 (define-read-only (get-multisig-count)
   (var-get multisig-counter)
+)
+
+(define-read-only (get-milestone-count)
+  (var-get milestone-counter)
 )
 
 (define-read-only (is-party-to-escrow (escrow-id uint) (user principal))
@@ -326,6 +502,16 @@
              (is-eq user (get creator escrow))
              (is-eq user (get recipient escrow))
              (is-approver user (get approvers escrow))
+           )
+    false
+  )
+)
+
+(define-read-only (is-party-to-milestone (milestone-id uint) (user principal))
+  (match (map-get? milestone-escrows milestone-id)
+    escrow (or 
+             (is-eq user (get payer escrow))
+             (is-eq user (get recipient escrow))
            )
     false
   )
@@ -392,6 +578,92 @@
   (begin
     (update-multisig-user-escrows approver multisig-id)
     multisig-id)
+)
+
+(define-private (update-milestone-user-escrows (user principal) (milestone-id uint))
+  (let
+    (
+      (current-escrows (default-to (list) (map-get? milestone-user-escrows user)))
+    )
+    (map-set milestone-user-escrows user (unwrap-panic (as-max-len? (append current-escrows milestone-id) u50)))
+  )
+)
+
+(define-private (create-false-list (count uint))
+  (if (is-eq count u0)
+    (list)
+    (if (is-eq count u1)
+      (list false)
+      (if (is-eq count u2)
+        (list false false)
+        (if (is-eq count u3)
+          (list false false false)
+          (if (is-eq count u4)
+            (list false false false false)
+            (if (is-eq count u5)
+              (list false false false false false)
+              (if (is-eq count u6)
+                (list false false false false false false)
+                (if (is-eq count u7)
+                  (list false false false false false false false)
+                  (if (is-eq count u8)
+                    (list false false false false false false false false)
+                    (if (is-eq count u9)
+                      (list false false false false false false false false false)
+                      (list false false false false false false false false false false)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+
+
+(define-private (calculate-remaining-amount (escrow {payer: principal, recipient: principal, total-amount: uint, milestone-count: uint, completed-milestones: uint, milestone-amounts: (list 10 uint), milestone-descriptions: (list 10 (string-ascii 100)), milestone-completed: (list 10 bool), milestone-approved: (list 10 bool), released: bool, refunded: bool, created-at: uint}))
+  (- (get total-amount escrow) (calculate-approved-amount-simple escrow))
+)
+
+(define-private (calculate-approved-amount-simple (escrow {payer: principal, recipient: principal, total-amount: uint, milestone-count: uint, completed-milestones: uint, milestone-amounts: (list 10 uint), milestone-descriptions: (list 10 (string-ascii 100)), milestone-completed: (list 10 bool), milestone-approved: (list 10 bool), released: bool, refunded: bool, created-at: uint}))
+  (let
+    (
+      (amounts (get milestone-amounts escrow))
+      (approved (get milestone-approved escrow))
+    )
+    (+ 
+      (if (and (> (len approved) u0) (unwrap-panic (element-at approved u0))) (unwrap-panic (element-at amounts u0)) u0)
+      (+ 
+        (if (and (> (len approved) u1) (unwrap-panic (element-at approved u1))) (unwrap-panic (element-at amounts u1)) u0)
+        (+ 
+          (if (and (> (len approved) u2) (unwrap-panic (element-at approved u2))) (unwrap-panic (element-at amounts u2)) u0)
+          (+ 
+            (if (and (> (len approved) u3) (unwrap-panic (element-at approved u3))) (unwrap-panic (element-at amounts u3)) u0)
+            (+ 
+              (if (and (> (len approved) u4) (unwrap-panic (element-at approved u4))) (unwrap-panic (element-at amounts u4)) u0)
+              (+ 
+                (if (and (> (len approved) u5) (unwrap-panic (element-at approved u5))) (unwrap-panic (element-at amounts u5)) u0)
+                (+ 
+                  (if (and (> (len approved) u6) (unwrap-panic (element-at approved u6))) (unwrap-panic (element-at amounts u6)) u0)
+                  (+ 
+                    (if (and (> (len approved) u7) (unwrap-panic (element-at approved u7))) (unwrap-panic (element-at amounts u7)) u0)
+                    (+ 
+                      (if (and (> (len approved) u8) (unwrap-panic (element-at approved u8))) (unwrap-panic (element-at amounts u8)) u0)
+                      (if (and (> (len approved) u9) (unwrap-panic (element-at approved u9))) (unwrap-panic (element-at amounts u9)) u0)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
 )
 
 (define-private (is-approver (user principal) (approvers (list 10 principal)))
