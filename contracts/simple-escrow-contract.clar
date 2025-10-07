@@ -16,10 +16,17 @@
 (define-constant ERR_INVALID_MILESTONE_COUNT (err u114))
 (define-constant ERR_ALL_MILESTONES_COMPLETED (err u115))
 (define-constant ERR_MILESTONE_NOT_COMPLETED (err u116))
+(define-constant ERR_RECURRING_PAUSED (err u117))
+(define-constant ERR_RECURRING_COMPLETED (err u118))
+(define-constant ERR_PAYMENT_NOT_DUE (err u119))
+(define-constant ERR_INVALID_INTERVAL (err u120))
+(define-constant ERR_ALREADY_PAUSED (err u121))
+(define-constant ERR_NOT_PAUSED (err u122))
 
 (define-data-var escrow-counter uint u0)
 (define-data-var multisig-counter uint u0)
 (define-data-var milestone-counter uint u0)
+(define-data-var recurring-counter uint u0)
 
 (define-map escrows
   uint
@@ -80,6 +87,28 @@
 )
 
 (define-map milestone-user-escrows
+  principal
+  (list 50 uint)
+)
+
+(define-map recurring-escrows
+  uint
+  {
+    payer: principal,
+    recipient: principal,
+    amount-per-period: uint,
+    interval-blocks: uint,
+    total-periods: uint,
+    periods-paid: uint,
+    last-payment-block: uint,
+    next-payment-block: uint,
+    paused: bool,
+    cancelled: bool,
+    created-at: uint
+  }
+)
+
+(define-map recurring-user-escrows
   principal
   (list 50 uint)
 )
@@ -263,6 +292,129 @@
   )
 )
 
+(define-public (create-recurring-escrow 
+  (recipient principal) 
+  (amount-per-period uint) 
+  (interval-blocks uint) 
+  (total-periods uint))
+  (let
+    (
+      (recurring-id (+ (var-get recurring-counter) u1))
+      (total-amount (* amount-per-period total-periods))
+      (first-payment-block (+ stacks-block-height interval-blocks))
+    )
+    (asserts! (> amount-per-period u0) ERR_INVALID_AMOUNT)
+    (asserts! (> interval-blocks u0) ERR_INVALID_INTERVAL)
+    (asserts! (> total-periods u0) ERR_INVALID_MILESTONE_COUNT)
+    (asserts! (not (is-eq tx-sender recipient)) ERR_NOT_AUTHORIZED)
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    (map-set recurring-escrows recurring-id
+      {
+        payer: tx-sender,
+        recipient: recipient,
+        amount-per-period: amount-per-period,
+        interval-blocks: interval-blocks,
+        total-periods: total-periods,
+        periods-paid: u0,
+        last-payment-block: u0,
+        next-payment-block: first-payment-block,
+        paused: false,
+        cancelled: false,
+        created-at: stacks-block-height
+      }
+    )
+    (update-recurring-user-escrows tx-sender recurring-id)
+    (update-recurring-user-escrows recipient recurring-id)
+    (var-set recurring-counter recurring-id)
+    (ok recurring-id)
+  )
+)
+
+(define-public (claim-recurring-payment (recurring-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? recurring-escrows recurring-id) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get recipient escrow)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get paused escrow)) ERR_RECURRING_PAUSED)
+    (asserts! (not (get cancelled escrow)) ERR_ESCROW_ALREADY_REFUNDED)
+    (asserts! (< (get periods-paid escrow) (get total-periods escrow)) ERR_RECURRING_COMPLETED)
+    (asserts! (>= stacks-block-height (get next-payment-block escrow)) ERR_PAYMENT_NOT_DUE)
+    (let
+      (
+        (new-periods-paid (+ (get periods-paid escrow) u1))
+        (new-next-payment (+ (get next-payment-block escrow) (get interval-blocks escrow)))
+      )
+      (try! (as-contract (stx-transfer? (get amount-per-period escrow) tx-sender (get recipient escrow))))
+      (map-set recurring-escrows recurring-id
+        (merge escrow
+          {
+            periods-paid: new-periods-paid,
+            last-payment-block: stacks-block-height,
+            next-payment-block: new-next-payment
+          }
+        )
+      )
+      (ok (get amount-per-period escrow))
+    )
+  )
+)
+
+(define-public (pause-recurring-escrow (recurring-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? recurring-escrows recurring-id) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get payer escrow)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get paused escrow)) ERR_ALREADY_PAUSED)
+    (asserts! (not (get cancelled escrow)) ERR_ESCROW_ALREADY_REFUNDED)
+    (map-set recurring-escrows recurring-id (merge escrow { paused: true }))
+    (ok true)
+  )
+)
+
+(define-public (resume-recurring-escrow (recurring-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? recurring-escrows recurring-id) ERR_ESCROW_NOT_FOUND))
+      (blocks-paused (- stacks-block-height (get last-payment-block escrow)))
+    )
+    (asserts! (is-eq tx-sender (get payer escrow)) ERR_NOT_AUTHORIZED)
+    (asserts! (get paused escrow) ERR_NOT_PAUSED)
+    (asserts! (not (get cancelled escrow)) ERR_ESCROW_ALREADY_REFUNDED)
+    (let
+      (
+        (adjusted-next-payment (+ (get next-payment-block escrow) blocks-paused))
+      )
+      (map-set recurring-escrows recurring-id
+        (merge escrow
+          {
+            paused: false,
+            next-payment-block: adjusted-next-payment
+          }
+        )
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (cancel-recurring-escrow (recurring-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? recurring-escrows recurring-id) ERR_ESCROW_NOT_FOUND))
+      (remaining-periods (- (get total-periods escrow) (get periods-paid escrow)))
+      (refund-amount (* remaining-periods (get amount-per-period escrow)))
+    )
+    (asserts! (or (is-eq tx-sender (get payer escrow)) (is-eq tx-sender (get recipient escrow))) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get cancelled escrow)) ERR_ESCROW_ALREADY_REFUNDED)
+    (asserts! (> refund-amount u0) ERR_INVALID_AMOUNT)
+    (try! (as-contract (stx-transfer? refund-amount tx-sender (get payer escrow))))
+    (map-set recurring-escrows recurring-id (merge escrow { cancelled: true }))
+    (ok refund-amount)
+  )
+)
+
 (define-public (approve-multisig-escrow (multisig-id uint))
   (let
     (
@@ -413,6 +565,10 @@
   (map-get? milestone-escrows milestone-id)
 )
 
+(define-read-only (get-recurring-escrow (recurring-id uint))
+  (map-get? recurring-escrows recurring-id)
+)
+
 (define-read-only (get-multisig-status (multisig-id uint))
   (let
     (
@@ -462,6 +618,28 @@
   )
 )
 
+(define-read-only (get-recurring-status (recurring-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? recurring-escrows recurring-id) ERR_ESCROW_NOT_FOUND))
+    )
+    (ok {
+      periods-paid: (get periods-paid escrow),
+      total-periods: (get total-periods escrow),
+      next-payment-block: (get next-payment-block escrow),
+      blocks-until-next: (if (> (get next-payment-block escrow) stacks-block-height)
+                           (- (get next-payment-block escrow) stacks-block-height)
+                           u0),
+      payment-ready: (>= stacks-block-height (get next-payment-block escrow)),
+      paused: (get paused escrow),
+      cancelled: (get cancelled escrow),
+      completed: (>= (get periods-paid escrow) (get total-periods escrow)),
+      remaining-amount: (* (- (get total-periods escrow) (get periods-paid escrow)) (get amount-per-period escrow)),
+      progress-percentage: (/ (* (get periods-paid escrow) u100) (get total-periods escrow))
+    })
+  )
+)
+
 (define-read-only (get-user-escrows (user principal))
   (default-to (list) (map-get? user-escrows user))
 )
@@ -474,6 +652,10 @@
   (default-to (list) (map-get? milestone-user-escrows user))
 )
 
+(define-read-only (get-user-recurring-escrows (user principal))
+  (default-to (list) (map-get? recurring-user-escrows user))
+)
+
 (define-read-only (get-escrow-count)
   (var-get escrow-counter)
 )
@@ -484,6 +666,10 @@
 
 (define-read-only (get-milestone-count)
   (var-get milestone-counter)
+)
+
+(define-read-only (get-recurring-count)
+  (var-get recurring-counter)
 )
 
 (define-read-only (is-party-to-escrow (escrow-id uint) (user principal))
@@ -509,6 +695,16 @@
 
 (define-read-only (is-party-to-milestone (milestone-id uint) (user principal))
   (match (map-get? milestone-escrows milestone-id)
+    escrow (or 
+             (is-eq user (get payer escrow))
+             (is-eq user (get recipient escrow))
+           )
+    false
+  )
+)
+
+(define-read-only (is-party-to-recurring (recurring-id uint) (user principal))
+  (match (map-get? recurring-escrows recurring-id)
     escrow (or 
              (is-eq user (get payer escrow))
              (is-eq user (get recipient escrow))
@@ -586,6 +782,15 @@
       (current-escrows (default-to (list) (map-get? milestone-user-escrows user)))
     )
     (map-set milestone-user-escrows user (unwrap-panic (as-max-len? (append current-escrows milestone-id) u50)))
+  )
+)
+
+(define-private (update-recurring-user-escrows (user principal) (recurring-id uint))
+  (let
+    (
+      (current-escrows (default-to (list) (map-get? recurring-user-escrows user)))
+    )
+    (map-set recurring-user-escrows user (unwrap-panic (as-max-len? (append current-escrows recurring-id) u50)))
   )
 )
 
