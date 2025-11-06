@@ -539,6 +539,21 @@
   )
 )
 
+(define-public (top-up-escrow (escrow-id uint) (additional-amount uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrows escrow-id) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (> additional-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq tx-sender (get buyer escrow)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_RELEASED)
+    (asserts! (not (get refunded escrow)) ERR_ESCROW_ALREADY_REFUNDED)
+    (try! (stx-transfer? additional-amount tx-sender (as-contract tx-sender)))
+    (map-set escrows escrow-id (merge escrow { amount: (+ (get amount escrow) additional-amount) }))
+    (ok (+ (get amount escrow) additional-amount))
+  )
+)
+
 (define-public (emergency-refund (escrow-id uint))
   (let
     (
